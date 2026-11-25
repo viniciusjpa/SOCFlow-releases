@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOCFlow
 // @namespace    somesso.socflow
-// @version      0.2.0
+// @version      0.2.1
 // @description  Automação de rotinas no SOC (Pesquisa Avançada, Ficha Clínica, ASO, assinatura de PDFs)
 // @author       Vinicius Farias Freitas
 // @homepageURL  https://github.com/viniciusjpa/SOCFlow-releases
@@ -12,7 +12,7 @@
 // @updateURL    https://github.com/viniciusjpa/SOCFlow-releases/raw/refs/heads/main/socflow.user.js
 // @downloadURL  https://github.com/viniciusjpa/SOCFlow-releases/raw/refs/heads/main/socflow.user.js
 // ==/UserScript==
-// Links de atualização PROVISÓRIOS: crie o repositório público e ajuste-os se o nome mudar.
+// Atualização automática pelo repositório público SOCFlow-releases (publicar com publicar.ps1).
 // A cada alteração, aumente o @version (o Tampermonkey só atualiza para versão maior).
 
 (function () {
