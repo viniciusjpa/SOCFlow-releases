@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOCFlow
 // @namespace    somesso.socflow
-// @version      0.2.1
+// @version      0.3.0
 // @description  Automação de rotinas no SOC (Pesquisa Avançada, Ficha Clínica, ASO, assinatura de PDFs)
 // @author       Vinicius Farias Freitas
 // @homepageURL  https://github.com/viniciusjpa/SOCFlow-releases
@@ -44,12 +44,46 @@
     ficha: {
       // F7 abre a edição e preenche o que estiver vazio (nunca altera o já respondido).
       // SOCNET: cada empresa tem formulário próprio, então só as empresas listadas aqui
-      // (código da empresa, visto ao lado do nome na barra do topo) são preenchidas:
-      // "Normal"/"Negativo" na seção EXAME FÍSICO + 1ª opção de CONDUTA GERAL.
+      // (código da empresa, visto ao lado do nome na barra do topo) são preenchidas.
+      // Títulos comparados pelo início do texto, sem diferenciar maiúsculas:
+      //   secoes:        seções preenchidas com a opção normal (Normal, Nega, Não,
+      //                  Sem alterações, ou a opção que não é "Alterado")
+      //   ignorar:       blocos (título contém) dentro dessas seções que ficam sem mexer
+      //   respostas:     pergunta/bloco/seção -> opção marcada (em qualquer seção)
+      //   primeiraOpcao: blocos em que se marca a 1ª opção
+      //   textos:        bloco -> texto do campo (só se o campo estiver vazio)
       socnet: {
         '488207': { // SBF COMERCIO DE PRODUTOS ESPORTIVOS
-          ignorarExames: ['OTONEUROLÓGICO'], // exames (título contém) que ficam sem mexer
-          condutaPrimeiraOpcao: true,
+          secoes: ['EXAME FÍSICO'],
+          ignorar: ['OTONEUROLÓGICO'],
+          primeiraOpcao: ['CONDUTA GERAL'],
+        },
+        '27850': { // ITAU UNIBANCO
+          secoes: ['EXAME FÍSICO ESPECIAL', 'EXAMES RESPIRATÓRIOS', 'Abdomen', 'Membros Superiores'],
+        },
+        '1468870': { // SHPS TECNOLOGIA E SERVICOS
+          secoes: ['EXAME FÍSICO REALIZADO PELO MÉDICO'],
+          respostas: { 'Parecer': 'Apto' },
+        },
+        '342090': { // CALCENTER CALCADOS CENTROOESTE
+          secoes: ['HMF'],
+          respostas: {
+            'Tabagismo': 'Nega',
+            'Etilismo': 'Refere',
+            'Outras drogas': 'Nega',
+            'Atividade Física': 'Nega',
+            'Parecer': 'Apto para função',
+          },
+          textos: {
+            'Estado geral': 'BEG, LOTE, AA',
+            'Inspeção geral': 'NDN',
+            'Precórdio': 'RCR EM 2T COM BCNF S/ SOPROS AUSCULTADOS',
+            'CPP': 'MV PRESENTE EM AHT SEM RA',
+            'Abd': 'FLÁCIDO E INDOLOR',
+            'Coluna': 'SEM DESVIOS',
+            'MMSS': 'NDN',
+            'MMII': 'VARIZES EM MMII',
+          },
         },
       },
       // Padrão (não SOCNET): anamnese abaixo (se vazia) e questionário normal/nega,
@@ -70,6 +104,9 @@
       // Homem: remove a frase/linha que começa com "DUM".
       // Demissional: remove frases/linhas que contenham estes termos (mesmo que alteradas):
       anamneseRemoverDemissional: ['Alergi', 'Lentes corretivas', 'Atividade física', 'Tabag', 'Etilis'],
+      // Tamanho (px) do campo de anamnese ao editar a ficha.
+      anamneseLargura: 500,
+      anamneseAltura: 150,
     },
     timeoutMs: 60000,        // espera máxima por elementos (PDF/SOCGED pode demorar)
   };
@@ -103,7 +140,8 @@
     el.style.cssText = 'position:fixed;z-index:2147483647;right:16px;bottom:16px;padding:10px 14px;border-radius:6px;' +
       'font:13px sans-serif;color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.3);background:' + (isError ? '#c62828' : '#2e7d32');
     doc.body.appendChild(el);
-    setTimeout(() => el.remove(), isError ? 8000 : 3000);
+    // Timer na janela do topo: o frame que chamou pode recarregar e levar o timer junto.
+    doc.defaultView.setTimeout(() => el.remove(), isError ? 10000 : 3000);
     (isError ? console.error : console.log)(LOG, msg);
   }
 
@@ -116,6 +154,14 @@
       sessionStorage.removeItem(chave);
       try { const p = JSON.parse(raw); return p && Date.now() - p.t < 30000 ? p.valor : null; } catch (_) { return null; }
     },
+  };
+
+  // Liga/desliga por sessão do navegador: cookie sem validade (some ao fechar o Chrome),
+  // compartilhado pela janela principal, frames e abas de impressão/prontuários.
+  const COOKIE = 'socflow_ativo';
+  const ativo = () => document.cookie.split('; ').includes(COOKIE + '=1');
+  const definirAtivo = (on) => {
+    document.cookie = on ? `${COOKIE}=1; path=/WebSoc; secure` : `${COOKIE}=; path=/WebSoc; max-age=0`;
   };
 
   async function run(name, fn) {
@@ -143,6 +189,8 @@
     .find((a) => a.getAttribute('href').includes(`doAcao('${x}')`) && visible(a));
 
   // ---------- 088 Pesquisa Avançada ----------
+  const PESQ_SOCNET = 'socflow.pesquisa.socnetAuto';
+
   function initPesquisa() {
     const $id = (id) => document.getElementById(id);
     const radio = $id('buscaFuncionario_0'); // "Funcionário"
@@ -157,11 +205,28 @@
       const opt = [...sel.options].find((o) => norm(o.text) === norm(CONFIG.pesquisa.padrao));
       if (opt) sel.value = opt.value;
     }
+    // Busca sem SOCNET sem resultado: marca SOCNET e busca de novo (uma vez; com SOCNET
+    // marcado a condição não se repete). Na próxima busca o SOCNET volta ao padrão.
+    const socnet = $id('acessoSocnet');
+    const nenhum = [...document.querySelectorAll('#fieldset-resultado-funcionario td')]
+      .some((td) => norm(td.innerText) === 'NENHUM RESULTADO');
+    if (nome.value.trim() && !socnet.checked && nenhum) {
+      socnet.checked = true;
+      passo.marcar(PESQ_SOCNET, true);
+      toast('não encontrado — buscando com SOCNET');
+      acao('browse').click();
+      return;
+    }
+    if (passo.consumir(PESQ_SOCNET)) socnet.dataset.socflowAuto = '1';
+    socnet.addEventListener('change', () => delete socnet.dataset.socflowAuto);
     // ENTER no campo nome/CPF dispara a busca (lupa "Localizar" = doAcao('browse')).
     // Captura no document para rodar antes do keydown próprio (jQuery) do campo.
+    if (initPesquisa.feito) { nome.focus(); return; }
+    initPesquisa.feito = true;
     document.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' || e.target !== nome || !nome.value.trim()) return;
+      if (e.key !== 'Enter' || e.target !== nome || !nome.value.trim() || !ativo()) return;
       e.preventDefault(); e.stopPropagation();
+      if (socnet.dataset.socflowAuto) { socnet.checked = CONFIG.pesquisa.socnetMarcado; delete socnet.dataset.socflowAuto; }
       acao('browse').click();
     }, true);
     nome.focus();
@@ -169,9 +234,22 @@
   }
 
   // ---------- assinatura digital (compartilhado: Impressão ASO e Prontuários) ----------
-  /** Botão do wizard de assinatura (div/p .botaoInstalacao) visível com texto exato. */
-  const botaoWizard = (texto) => [...document.querySelectorAll('.botaoInstalacao')]
-    .find((e) => visible(e) && norm(e.innerText) === norm(texto));
+  // Botões do assistente de assinatura (div .botaoInstalacao). O texto muda conforme a empresa
+  // (no HTML o "Avançar" vem como "Assinar PDF Digitalmente"; com biometria vira "Avançar"), a classe não.
+  const WIZARD = {
+    capturar: ['pcBotaoIniciar', 'Capturar digital'],
+    avancar: ['pcBotaoAvancar', 'Avançar'],
+    gerar: ['pcBotaoProximo', 'Gerar PDF no SOCGED'],
+    assinar: ['pcBotaoConcluir', 'Assinar PDF Digitalmente'],
+  };
+  /** Botão do assistente visível e habilitado (sem .gray); pelo texto se a tela não usar as classes. */
+  const botaoWizard = (passo) => {
+    const [cls, texto] = WIZARD[passo];
+    const porClasse = [...document.querySelectorAll('.botaoInstalacao.' + cls)];
+    const lista = porClasse.length ? porClasse : [...document.querySelectorAll('.botaoInstalacao')]
+      .filter((e) => norm(e.innerText) === norm(texto));
+    return lista.find((e) => visible(e) && !e.classList.contains('gray'));
+  };
 
   /**
    * Abre o assistente de assinatura (botão "Capturar biometria, criar pdf e assinar digitalmente",
@@ -179,7 +257,7 @@
    * vizinho capturaBiometriaDesktop() (5px) abre a "Captura Biométrica" antiga, não o assistente.
    */
   async function abrirAssinatura() {
-    const aberto = () => botaoWizard('Capturar digital') || botaoWizard('Avançar') || botaoWizard('Gerar PDF no SOCGED');
+    const aberto = () => botaoWizard('capturar') || botaoWizard('avancar') || botaoWizard('gerar');
     if (aberto()) return aberto(); // já aberto pelo usuário
     const b = await waitFor(() => visivelPorId('processoCompletoAssinar'),
       'botão "Capturar biometria, criar pdf e assinar"');
@@ -192,8 +270,8 @@
 
   /** Gerar PDF no SOCGED → Assinar PDF Digitalmente → certificado → Iniciar Assinatura. Para aí. */
   async function gerarEAssinar(timeoutGerar = CONFIG.timeoutMs) {
-    (await waitFor(() => botaoWizard('Gerar PDF no SOCGED'), '"Gerar PDF no SOCGED"', timeoutGerar)).click();
-    (await waitFor(() => botaoWizard('Assinar PDF Digitalmente'), '"Assinar PDF Digitalmente"')).click();
+    (await waitFor(() => botaoWizard('gerar'), '"Gerar PDF no SOCGED"', timeoutGerar)).click();
+    (await waitFor(() => botaoWizard('assinar'), '"Assinar PDF Digitalmente"')).click();
     const combo = await waitFor(() => visivelPorId('combo_certificados'), 'lista de certificados');
     const { operador, certificado } = CONFIG.assinatura;
     const opt = [...combo.options].find((o) => certificado
@@ -210,9 +288,9 @@
   // ---------- Impressão ASO (cad017.do em aba própria) ----------
   async function fluxoImpressaoAso() {
     await abrirAssinatura();
-    // Biometria já foi coletada na triagem: "Avançar" se existir; senão segue direto.
-    const prox = await waitFor(() => botaoWizard('Avançar') || botaoWizard('Gerar PDF no SOCGED'), '"Avançar"');
-    if (norm(prox.innerText) === 'AVANÇAR') prox.click();
+    // Biometria já foi coletada na triagem (ou a empresa não usa): avança para "Gerar PDF".
+    const prox = await waitFor(() => botaoWizard('avancar') || botaoWizard('gerar'), '"Avançar"');
+    if (prox === botaoWizard('avancar')) prox.click();
     await gerarEAssinar();
   }
 
@@ -222,17 +300,18 @@
     // Clicar de novo em "Ficha Clínica" com ela aberta a recolheria.
     if (!visivelPorId('processoCompletoAssinar')) document.getElementById('fichaClinicaC').click();
     await abrirAssinatura();
-    const btn = await waitFor(() => botaoWizard('Capturar digital') || botaoWizard('Avançar'), 'janela de biometria');
+    const btn = await waitFor(() => botaoWizard('capturar') || botaoWizard('avancar'), 'janela de biometria');
+    const captura = btn === botaoWizard('capturar'); // antes do clique: depois ele some/fica cinza
     btn.click();
-    if (norm(btn.innerText) === 'CAPTURAR DIGITAL') {
+    if (captura) {
       toast('Faça a captura da digital — o SOCFlow continua depois');
       // Captura manual (até 5 min): espera a janela "Captura Biométrica" abrir e fechar.
       const captura = () => visivelPorId('btn-cancelar-biometria');
       await waitFor(captura, 'janela de captura', 15000).catch(() => {});
       await waitFor(() => !captura(), 'captura da digital', 5 * 60000);
       // Após a captura segue para "Gerar PDF no SOCGED"; se o assistente liberar "Avançar", clica.
-      const prox = await waitFor(() => botaoWizard('Gerar PDF no SOCGED') || botaoWizard('Avançar'), '"Gerar PDF no SOCGED"');
-      if (norm(prox.innerText) === 'AVANÇAR') prox.click();
+      const prox = await waitFor(() => botaoWizard('gerar') || botaoWizard('avancar'), '"Gerar PDF no SOCGED"');
+      if (prox === botaoWizard('avancar')) prox.click();
     }
     await gerarEAssinar();
   }
@@ -329,31 +408,55 @@
   const fichaSocnet = () => [...window.top.document.querySelectorAll('span')]
     .some((e) => !e.children.length && norm(e.innerText) === 'SOCNET' && visible(e));
 
+  // Opção "normal" na ficha padrão e nas fichas SOCNET (que usam textos como "Sem alterações").
+  const NORMAL_PADRAO = { radio: /^(NORMAL|NEGATIVO)/, checkbox: /^(NORMAL|NEGA)/ };
+  const NORMAL_SOCNET = { radio: /^(NORMAL|NEGA|NÃO$|SEM ALTERA)/, checkbox: /^(NORMAL|NEGA|NÃO$|SEM ALTERA)/ };
+
+  /** Radio normal do grupo; num par "<descrição normal> | Alterado", a descrição. */
+  function radioNormal(radios, re) {
+    const alvo = radios.find((r) => re.test(rotuloOpcao(r)));
+    if (alvo || radios.length !== 2) return alvo;
+    const outros = radios.filter((r) => rotuloOpcao(r) !== 'ALTERADO');
+    return outros.length === 1 ? outros[0] : undefined;
+  }
+
   /**
    * Preenche um bloco (subgrupo) só se nada nele estiver respondido.
-   * Radios: resposta configurada pela pergunta, senão "Normal"/"Negativo".
-   * Checkboxes: todas as opções "Normal..."/"Nega...". Nunca desmarca nada.
+   * Radios: resposta configurada (pela pergunta, título do bloco ou seção); sem ela, a opção
+   * normal se `normal` for dado. Checkboxes: as opções normais. Nunca desmarca nada.
    */
-  function preencherBloco(t, cont) {
+  function preencherBloco({ t, secao, titulo }, cont, respostas, normal) {
     const inputs = [...t.querySelectorAll('input[type=radio],input[type=checkbox]')];
     if (!inputs.length) return;
     if (inputs.some((i) => i.checked)) { cont.mantidos++; return; }
-    const titulo = norm(t.rows[0] && t.rows[0].innerText);
     const grupos = [...new Set(inputs.filter((i) => i.type === 'radio').map((r) => r.name))];
     for (const nome of grupos) {
       const radios = inputs.filter((r) => r.name === nome);
-      // A pergunta fica na linha do radio ("Varizes Sim Não") ou no título do bloco ("Refeições regulares?").
+      // A pergunta fica na linha do radio ("Varizes Sim Não"), no título do bloco
+      // ("Refeições regulares?") ou na seção (bloco sem título, ex.: "Parecer").
       const linha = norm(radios[0].closest('tr').innerText);
-      const chave = Object.keys(CONFIG.ficha.respostas)
-        .find((k) => linha.startsWith(norm(k)) || titulo.startsWith(norm(k)));
+      const chave = Object.keys(respostas)
+        .find((k) => [linha, titulo, secao].some((x) => x.startsWith(norm(k))));
       const alvo = chave
-        ? radios.find((r) => rotuloOpcao(r) === norm(CONFIG.ficha.respostas[chave]))
-        : radios.find((r) => /^(NORMAL|NEGATIVO)/.test(rotuloOpcao(r)));
+        ? radios.find((r) => rotuloOpcao(r) === norm(respostas[chave]))
+        : normal && radioNormal(radios, normal.radio);
       if (alvo) { alvo.click(); cont.marcados++; }
     }
-    for (const c of inputs.filter((i) => i.type === 'checkbox' && /^(NORMAL|NEGA)/.test(rotuloOpcao(i)))) {
+    if (!normal) return;
+    for (const c of inputs.filter((i) => i.type === 'checkbox' && normal.checkbox.test(rotuloOpcao(i)))) {
       c.click(); cont.marcados++;
     }
+  }
+
+  /** Campo de texto do bloco preenchido com `texto`, só se estiver vazio. */
+  function preencherTexto({ t }, cont, texto) {
+    const campo = [...t.querySelectorAll('textarea,input[type=text]')].find(visible);
+    if (!campo) return;
+    if (campo.value.trim()) { cont.mantidos++; return; }
+    campo.value = texto;
+    campo.dispatchEvent(new Event('input', { bubbles: true }));
+    campo.dispatchEvent(new Event('change', { bubbles: true }));
+    cont.marcados++;
   }
 
   function preencherFicha() {
@@ -363,18 +466,23 @@
     const cont = { marcados: 0, mantidos: 0 };
 
     if (fichaSocnet()) {
-      // SOCNET (formulário da empresa): só EXAME FÍSICO + 1ª opção da CONDUTA GERAL.
+      // SOCNET (formulário da empresa): só o que a regra da empresa pede.
       const empresa = (document.querySelector('input[name=empresaNavegacao]') || {}).value;
       const regra = cfg.socnet[empresa];
       if (!regra) { toast(`Ficha SOCNET da empresa ${empresa}: sem regra no CONFIG, nada preenchido`); return; }
-      for (const { t, secao, titulo } of blocos) {
-        if (secao.startsWith('EXAME FÍSICO') && !regra.ignorarExames.some((x) => titulo.includes(norm(x)))) preencherBloco(t, cont);
-      }
-      if (regra.condutaPrimeiraOpcao) {
-        const conduta = blocos.find((b) => b.titulo.startsWith('CONDUTA GERAL'));
-        const caixas = conduta ? [...conduta.t.querySelectorAll('input[type=checkbox]')] : [];
-        if (caixas.length && !caixas.some((c) => c.checked)) { caixas[0].click(); cont.marcados++; }
-        else if (caixas.length) cont.mantidos++;
+      const { secoes = [], ignorar = [], respostas = {}, primeiraOpcao = [], textos = {} } = regra;
+      const comeca = (x, lista) => lista.find((k) => x.startsWith(norm(k)));
+      for (const b of blocos) {
+        const texto = comeca(b.titulo, Object.keys(textos));
+        if (texto) { preencherTexto(b, cont, textos[texto]); continue; }
+        if (comeca(b.titulo, primeiraOpcao)) {
+          const opcoes = [...b.t.querySelectorAll('input[type=radio],input[type=checkbox]')];
+          if (opcoes.some((c) => c.checked)) cont.mantidos++;
+          else if (opcoes.length) { opcoes[0].click(); cont.marcados++; }
+          continue;
+        }
+        const normal = comeca(b.secao, secoes) && !ignorar.some((x) => b.titulo.includes(norm(x)));
+        preencherBloco(b, cont, respostas, normal ? NORMAL_SOCNET : null);
       }
     } else {
       // Padrão (não SOCNET): anamnese padrão + todo o questionário normal/nega.
@@ -402,7 +510,7 @@
           cont.marcados++;
         } else cont.mantidos++;
       }
-      for (const { t } of blocos) preencherBloco(t, cont);
+      for (const b of blocos) preencherBloco(b, cont, cfg.respostas, NORMAL_PADRAO);
     }
 
     if (!cont.marcados && !cont.mantidos) return; // ficha sem questionário personalizado
@@ -417,8 +525,20 @@
     return true;
   }
 
+  /** Aumenta o campo de anamnese (modo edição) para caber o texto. */
+  function ajustarAnamnese() {
+    const { anamneseLargura: w, anamneseAltura: h } = CONFIG.ficha;
+    for (const t of document.querySelectorAll('textarea[name=anamnese]')) {
+      t.style.setProperty('width', w + 'px', 'important');
+      t.style.setProperty('height', h + 'px', 'important');
+    }
+  }
+
   function retomarFicha() {
-    if (passo.consumir(FICHA_STEP) && acao('save')) run('Ficha', preencherFicha);
+    const pendente = passo.consumir(FICHA_STEP);
+    if (!acao('save')) return;
+    ajustarAnamnese();
+    if (pendente) run('Ficha', preencherFicha);
   }
 
   // ---------- automações F8 ----------
@@ -440,6 +560,7 @@
   };
   window.__socflow = {
     page,
+    iniciar,
     f8: f8[page],
     f7: page === 'ficha' ? editarFicha : null, // F7: editar ficha clínica (+ preencher normais)
     salvar: clicar('save', 'salvar'),                             // Ctrl+Enter: gravar (qualquer tela)
@@ -465,6 +586,14 @@
   // No window (fase de captura): algumas telas (ex.: modal de biometria) interrompem a
   // propagação do teclado antes de chegar ao document.
   window.addEventListener('keydown', (e) => {
+    if (!ativo()) {
+      // F7/F8 desativados: evita a ação padrão do Chrome (F7 = navegação por cursor).
+      if (e.key === 'F7' || e.key === 'F8') {
+        e.preventDefault(); e.stopPropagation();
+        toast('desativado — ative no botão ? (canto inferior esquerdo)', true);
+      }
+      return;
+    }
     const tipo =
       e.key === 'F8' ? 'f8' :
       e.key === 'F7' ? 'f7' :
@@ -483,15 +612,19 @@
       ['', '• Assinar prontuários: Ficha Clínica → Capturar digital (você captura) → PDF → assinatura.'],
       ['F7', 'Ficha Clínica: Alterar e preencher os campos normais vazios (não altera o que já está respondido).'],
       ['Ctrl+Enter', 'Gravar (qualquer tela com o botão Gravar).'],
-      ['Enter', 'Pesquisa Avançada (088): buscar o nome/CPF digitado.'],
+      ['Enter', 'Pesquisa Avançada (088): buscar o nome/CPF digitado. Sem resultado, busca de novo com SOCNET.'],
       ['', 'A senha do certificado digital é sempre digitada por você.'],
+      ['', 'O SOCFlow começa desligado a cada abertura do Chrome: ligue no botão acima.'],
     ];
     const css = document.createElement('style');
     css.textContent = `
       #socflow-ajuda-btn{position:fixed;left:10px;bottom:10px;z-index:2147483646;width:24px;height:24px;border-radius:50%;
         border:1px solid #9e9e9e;background:#fff;color:#555;font:bold 13px/22px sans-serif;text-align:center;cursor:pointer;
         opacity:.35;transition:opacity .15s;padding:0}
+      #socflow-ajuda-btn.ligado{border-color:#2e7d32;background:#2e7d32;color:#fff;opacity:.6}
       #socflow-ajuda-btn:hover,#socflow-ajuda-btn:focus-visible,#socflow-ajuda-btn[aria-expanded=true]{opacity:1}
+      #socflow-ajuda .socflow-chave{display:block;margin:0 0 8px;font-weight:bold;cursor:pointer}
+      #socflow-ajuda .socflow-chave input{margin:0 4px 0 0;vertical-align:middle}
       #socflow-ajuda{position:fixed;left:10px;bottom:42px;z-index:2147483646;max-width:440px;padding:12px 14px;border-radius:8px;
         background:#fff;color:#222;font:12px/1.45 sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.25);border:1px solid #ddd}
       #socflow-ajuda[hidden]{display:none}
@@ -512,6 +645,11 @@
     painel.setAttribute('aria-label', 'Ajuda do SOCFlow');
     const h = document.createElement('h2');
     h.textContent = `SOCFlow v${VERSAO} — atalhos`;
+    const chave = document.createElement('label');
+    chave.className = 'socflow-chave';
+    const caixa = document.createElement('input');
+    caixa.type = 'checkbox';
+    chave.append(caixa, ' SOCFlow ligado');
     const tabela = document.createElement('table');
     for (const [tecla, texto] of AJUDA) {
       const tr = tabela.insertRow();
@@ -522,14 +660,28 @@
     const rodape = document.createElement('footer');
     const link = (href, txt) => { const a = document.createElement('a'); a.href = href; a.target = '_blank'; a.rel = 'noopener'; a.textContent = txt; return a; };
     rodape.append(`Versão instalada: ${VERSAO} · `, link(REPO, 'repositório'), ' · ', link(INSTALAR, 'instalar/atualizar'));
-    painel.append(h, tabela, rodape);
+    painel.append(h, chave, tabela, rodape);
 
     const btn = document.createElement('button');
     btn.id = 'socflow-ajuda-btn';
     btn.type = 'button';
     btn.textContent = '?';
-    btn.title = `SOCFlow v${VERSAO} — ajuda dos atalhos`;
-    btn.setAttribute('aria-label', btn.title);
+    const mostrarEstado = () => {
+      const on = ativo();
+      caixa.checked = on;
+      btn.classList.toggle('ligado', on);
+      btn.title = `SOCFlow v${VERSAO} ${on ? 'ligado' : 'desligado'} — ajuda e liga/desliga`;
+      btn.setAttribute('aria-label', btn.title);
+    };
+    mostrarEstado();
+    caixa.addEventListener('change', () => {
+      definirAtivo(caixa.checked);
+      mostrarEstado();
+      toast(caixa.checked ? 'ligado' : 'desligado');
+      if (caixa.checked) for (const w of allFrames()) if (w.__socflow) w.__socflow.iniciar();
+    });
+    // Outra aba pode ter ligado/desligado: atualiza ao voltar para esta.
+    window.addEventListener('focus', mostrarEstado);
     btn.setAttribute('aria-expanded', 'false');
     btn.setAttribute('aria-controls', painel.id);
     const alternar = (abrir) => {
@@ -542,9 +694,15 @@
     document.body.append(painel, btn);
   }
 
+  /** Ações ao carregar a página (ou ao ligar o SOCFlow com ela aberta). */
+  function iniciar() {
+    if (!ativo()) return;
+    if (page === 'pesquisa') initPesquisa();
+    if (page === 'aso') retomarAso();
+    if (page === 'ficha') retomarFicha();
+    if (page) log(`v${VERSAO} página:`, page);
+  }
+
   if (isTop && document.body) criarAjuda();
-  if (page === 'pesquisa') initPesquisa();
-  if (page === 'aso') retomarAso();
-  if (page === 'ficha') retomarFicha();
-  if (page) log(`v${VERSAO} página:`, page);
+  iniciar();
 })();
